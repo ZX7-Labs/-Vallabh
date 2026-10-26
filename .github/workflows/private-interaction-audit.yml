@@ -1,0 +1,124 @@
+name: Private website interaction audit
+on:
+  push:
+    branches: [main]
+    paths: ["RUN_AUDIT"]
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve private HEAD
+        id: target
+        shell: bash
+        env:
+          PRIVATE_REPOSITORY: ${{ secrets.PRIVATE_REPOSITORY }}
+          PRIVATE_READ_TOKEN: ${{ secrets.PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$PRIVATE_READ_TOKEN"
+          echo "::add-mask::$PRIVATE_READ_TOKEN"
+          repo="${PRIVATE_REPOSITORY:-ZX7-Labs/ai-product-web}"
+          branch="$(tr -d '\r\n' < VERIFY_BRANCH)"
+          auth="$(printf 'x-access-token:%s' "$PRIVATE_READ_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          line="$(git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" ls-remote "https://github.com/${repo}.git" "refs/heads/${branch}" 2>"$RUNNER_TEMP/private-resolve.log")"
+          sha="$(printf '%s\n' "$line" | awk 'NR==1 {print $1}')"
+          bash scripts/validate-input.sh "$sha"
+          echo "value=$sha" >> "$GITHUB_OUTPUT"
+          echo "INTERACTION_TARGET_SHA=$sha"
+      - name: Exact private checkout
+        shell: bash
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.value }}
+          PRIVATE_READ_TOKEN: ${{ secrets.PRIVATE_READ_TOKEN }}
+        run: bash scripts/checkout-private.sh
+      - name: Generate site (logs stay private on runner)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update >/dev/null
+          if (cd "$RUNNER_TEMP/private-source" && RUSTUP_TOOLCHAIN=1.98.1 bash scripts/build-release.sh) >"$RUNNER_TEMP/private-audit-build.log" 2>&1; then
+            echo "INTERACTION_BUILD=PASS"
+          else
+            echo "INTERACTION_BUILD=FAIL"
+            exit 73
+          fi
+      - name: Check real browser interaction and reflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/private-source/dist"
+          cat > "$root/__private_audit__.html" <<'HTML'
+          <!doctype html><html lang="en"><meta charset="utf-8"><title>Browser audit</title>
+          <style>html,body{margin:0;padding:0}iframe{width:100%;height:90vh;box-sizing:border-box;border:0}</style>
+          <iframe id="frame" src="/"></iframe><output id="report">AUDIT_PENDING</output>
+          <script>
+          const routes=["/","/product/","/capabilities/","/trust/","/download/","/releases/","/security/","/privacy/","/terms/","/support/"];
+          const f=document.getElementById("frame"), out=document.getElementById("report");
+          const wait=(path)=>new Promise((resolve,reject)=>{let alarm=setTimeout(()=>reject(Error("TIMEOUT")),3000);f.onload=()=>{clearTimeout(alarm);resolve(f.contentWindow)};f.src=path});
+          const test=async()=>{
+            const errors=[];
+            const check=(condition,id)=>{if(!condition)errors.push(id)};
+            for(const path of routes){
+              const win=await wait(path),doc=win.document;
+              check(!!doc.querySelector("main"),"MAIN_"+path);
+              check(!!doc.querySelector("h1"),"H1_"+path);
+              check(win.document.documentElement.scrollWidth<=win.innerWidth+2,"OVERFLOW_"+path);
+              check(!!doc.querySelector('a[href="/product/"]'),"NAV_"+path);
+              if(path==="/"){
+                check(doc.querySelector("#hero-title")?.textContent?.trim()==="X7.AI","BRAND");
+                check(doc.body.textContent.includes("ZX7 Labs"),"STUDIO");
+                let buttons=[...doc.querySelectorAll(".atlas-stage-button")];
+                check(buttons.length===5,"BUTTONS");
+                const inst=doc.querySelector(".atlas-instrument");
+                const title=doc.querySelector("#atlas-stage-title");
+                if(buttons.length===5 && inst && title){
+                  buttons[4].click();
+                  check(inst.dataset.activeStage==="5","STAGE_CLICK");
+                  check(title.textContent.trim()==="Continue","STAGE_TITLE");
+                  check(buttons[4].getAttribute("aria-pressed")==="true","STAGE_PRESSED");
+                  buttons[4].dispatchEvent(new win.KeyboardEvent("keydown",{key:"ArrowRight",bubbles:true}));
+                  check(inst.dataset.activeStage==="1","KEYBOARD_CYCLE");
+                  const motion=doc.querySelector("#atlas-motion-toggle");
+                  if(motion && !motion.disabled){
+                    motion.click();
+                    check(motion.getAttribute("aria-pressed")==="true","PAUSE");
+                    check(inst.dataset.motionPaused==="true","PAUSE_STATE");
+                    motion.click();
+                    check(inst.dataset.motionPaused==="false","RESUME");
+                  }else{
+                    check(!!motion,"MOTION_CONTROL");
+                    check(inst.dataset.motionPaused==="true","REDUCED_MOTION");
+                  }
+                }
+              }
+            }
+            out.textContent=errors.length?"AUDIT_FAIL "+errors.join(","):"AUDIT_PASS";
+          };
+          window.addEventListener("load",()=>{test().catch(e=>{out.textContent="AUDIT_FAIL_RUNTIME "+e.message})});
+          </script></html>
+          HTML
+          python3 -m http.server 8766 --bind 127.0.0.1 --directory "$root" >"$RUNNER_TEMP/private-audit-http.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          sleep 2
+          chrome="$(command -v google-chrome || command -v chromium || true)"
+          test -n "$chrome"
+          for screen in "1440,900" "390,844" "320,740"; do
+            "$chrome" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --hide-scrollbars --window-size="$screen" --virtual-time-budget=14000 --dump-dom "http://127.0.0.1:8766/__private_audit__.html" >"$RUNNER_TEMP/audit-dom.log" 2>"$RUNNER_TEMP/audit-chrome.log"
+            if ! grep -q '>AUDIT_PASS<' "$RUNNER_TEMP/audit-dom.log"; then
+              echo "INTERACTION_AUDIT=FAIL viewport=$screen"
+              grep -o 'AUDIT_FAIL[^<]*' "$RUNNER_TEMP/audit-dom.log" | tail -1 || true
+              exit 74
+            fi
+            echo "INTERACTION_AUDIT=PASS viewport=$screen"
+          done
+          "$chrome" --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage --hide-scrollbars --force-prefers-reduced-motion --window-size="390,844" --virtual-time-budget=14000 --dump-dom "http://127.0.0.1:8766/__private_audit__.html" >"$RUNNER_TEMP/audit-dom-reduced.log" 2>"$RUNNER_TEMP/audit-chrome-reduced.log"
+          grep -q '>AUDIT_PASS<' "$RUNNER_TEMP/audit-dom-reduced.log"
+          echo "REDUCED_MOTION_AUDIT=PASS"
