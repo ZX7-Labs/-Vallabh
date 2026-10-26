@@ -1,0 +1,76 @@
+name: Private website visual qualification
+on:
+  push:
+    branches: [main]
+    paths: ["RUN_VISUAL"]
+permissions:
+  contents: read
+jobs:
+  visual:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Resolve exact private branch
+        id: target
+        shell: bash
+        env:
+          PRIVATE_REPOSITORY: ${{ secrets.PRIVATE_REPOSITORY }}
+          PRIVATE_READ_TOKEN: ${{ secrets.PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$PRIVATE_READ_TOKEN"
+          echo "::add-mask::$PRIVATE_READ_TOKEN"
+          repo="${PRIVATE_REPOSITORY:-ZX7-Labs/ai-product-web}"
+          branch="$(tr -d '\r\n' < VERIFY_BRANCH)"
+          auth="$(printf 'x-access-token:%s' "$PRIVATE_READ_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          line="$(git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" ls-remote "https://github.com/${repo}.git" "refs/heads/${branch}" 2>"$RUNNER_TEMP/visual-private-resolve.log")"
+          sha="$(printf '%s\n' "$line" | awk 'NR==1 {print $1}')"
+          bash scripts/validate-input.sh "$sha"
+          echo "value=$sha" >> "$GITHUB_OUTPUT"
+          echo "VISUAL_TARGET_OK=$sha"
+      - name: Private checkout
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.value }}
+          PRIVATE_READ_TOKEN: ${{ secrets.PRIVATE_READ_TOKEN }}
+        run: bash scripts/checkout-private.sh
+      - name: Private site build
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt --component clippy --no-self-update >/dev/null
+          export RUSTUP_TOOLCHAIN=1.98.1
+          if (cd "$RUNNER_TEMP/private-source" && bash scripts/build-release.sh) >"$RUNNER_TEMP/private-visual-build.log" 2>&1; then echo "VISUAL_BUILD=PASS"; else echo "VISUAL_BUILD=FAIL"; exit 73; fi
+      - name: Desktop and mobile screenshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          chrome="$(command -v google-chrome || command -v chromium || true)"
+          test -n "$chrome"
+          mkdir -p "$RUNNER_TEMP/x7-visual"
+          cd "$RUNNER_TEMP/private-source/dist"
+          python3 -m http.server 8765 --bind 127.0.0.1 >"$RUNNER_TEMP/private-visual-http.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          sleep 2
+          for route in home product capabilities trust download; do
+            path="/$route/"
+            test "$route" != "home" || path="/"
+            for screen in desktop mobile; do
+              if [[ "$screen" == "desktop" ]]; then size="1440,900"; else size="390,844"; fi
+              "$chrome" --headless=new --no-sandbox --disable-gpu --hide-scrollbars --disable-dev-shm-usage --force-device-scale-factor=1 --window-size="$size" --virtual-time-budget=2200 --screenshot="$RUNNER_TEMP/x7-visual/${route}-${screen}.png" "http://127.0.0.1:8765${path}" >"$RUNNER_TEMP/private-visual-chrome.log" 2>&1
+              test -s "$RUNNER_TEMP/x7-visual/${route}-${screen}.png"
+            done
+          done
+          echo "VISUAL_CAPTURE=PASS"
+      - name: Upload screenshot-only artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: x7-private-visual-screenshots
+          path: ${{ runner.temp }}/x7-visual/*.png
+          retention-days: 7
+          if-no-files-found: error
